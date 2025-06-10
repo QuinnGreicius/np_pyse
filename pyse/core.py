@@ -946,20 +946,37 @@ class SE:
             out = self.task_table[self.task_table['task'] == task_name]
         if make_stim_cue_cols:
             out = self.make_stim_cue_cols(out)
-        if enrich:
-            out = self.enrich_task_df(out, task_name)
-        out.reset_index(drop=True, inplace=True)
-        # For each of the rows, if the stimOnset (if not nan) and stimOffset (if not nan) as any of the other rows, then they should have the same trialIndex
+        
+        # Step 1: Create a key only for rows where both stimOnset and stimOffset are not NaN
         mask = (~out['stimOnset'].isna()) & (~out['stimOffset'].isna())
         stim_keys = pd.Series(np.where(mask, 
             out['stimOnset'].astype(str) + "_" + out['stimOffset'].astype(str),
             np.nan
         ))
-        stim_group = stim_keys.where(stim_keys.notna()).ffill()
-        stim_group[stim_keys.isna()] = np.nan
-        codes, _ = pd.factorize(stim_group)
-        out['trialIndex'] = codes
+
+        trial_indices = []
+        key_to_index = {}
+        next_index = 0
+
+        # Step 3: Iterate over rows to preserve order and assign trialIndex
+        for key in stim_keys:
+            if pd.isna(key):
+                # assign a new unique trialIndex for NaN
+                trial_indices.append(next_index)
+                next_index += 1
+            else:
+                if key not in key_to_index:
+                    key_to_index[key] = next_index
+                    next_index += 1
+                trial_indices.append(key_to_index[key])
+
+        # Step 4: Assign to DataFrame
+        out['trialIndex'] = trial_indices
         out['trialLabel'] = out['label']
+        
+        if enrich:
+            out = self.enrich_task_df(out, task_name)
+        out.reset_index(drop=True, inplace=True)
         return out
     
     def enrich_task_df(self, table: pd.DataFrame, task_name: str) -> pd.DataFrame:
