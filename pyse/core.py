@@ -144,16 +144,21 @@ class SE:
             if not kilosort_dir.exists():
                 raise FileNotFoundError(f"{self.recid} Kilosort directory does not exist.")
             excluded_probes = []
+            if self.ks_suffix:
+                pattern = f"{self.recid}_g*_imec*{self.ks_suffix}"
+            else:
+                pattern = f"{self.recid}_g*_imec[0-9]"  # only matches imec followed by a digit
+
             if (kilosort_dir / f"mc_{self.recid}_g0").exists():
                 mc_dir = kilosort_dir / f"mc_{self.recid}_g0"
-                mc_folders = glob.glob(str(mc_dir / f"{self.recid}_g*_imec*{self.ks_suffix}"))
+                mc_folders = glob.glob(str(mc_dir / pattern))
                 # Extract the probe indices from the folder names and exclude them 
                 probe_inds = [int(re.search(r"imec(\d+)", folder).group(1)) for folder in mc_folders]
                 excluded_probes.extend(probe_inds)
                 ks_dirs.extend(mc_folders)
             
             catgt_dir = kilosort_dir / f"catgt_{self.recid}_g0"
-            catgt_folders = glob.glob(str(catgt_dir / f"{self.recid}_g*_imec*{self.ks_suffix}"))
+            catgt_folders = glob.glob(str(catgt_dir / pattern))
             catgt_folders = [folder for folder in catgt_folders if int(re.search(r"imec(\d+)", folder).group(1)) not in excluded_probes]
             ks_dirs.extend(catgt_folders)
             return [Path(folder) for folder in ks_dirs]
@@ -1112,11 +1117,18 @@ class SE:
             else:
                 sample_rate = 30000 # TODO : change this to read from the metadata
 
-            spike_times = np.load(ks_dir / "spike_times.npy") / sample_rate
-            spike_clusters = np.load(ks_dir / "spike_clusters.npy")
-            depths = np.load(ks_dir / "spike_positions.npy")
+            spike_times = np.load(ks_dir / "spike_times.npy").flatten() / sample_rate
+            spike_clusters = np.load(ks_dir / "spike_clusters.npy").flatten()
+            # Try loading spike positions, if it fails, try loading spike_centroids.npy
+            if (ks_dir / "spike_positions.npy").exists():
+                depths = np.load(ks_dir / "spike_positions.npy")
+            elif (ks_dir / "spike_centroids.npy").exists():
+                depths = np.load(ks_dir / "spike_centroids.npy")
+            else:
+                raise FileNotFoundError(f"Neither spike_positions.npy nor spike_centroids.npy found in {ks_dir}.")
+            
             depths = depths[:, 1] # Assuming depth is in the second column
-            amplitudes = np.load(ks_dir / "amplitudes.npy")
+            amplitudes = np.load(ks_dir / "amplitudes.npy").flatten()
             probe = int(re.search(r"imec(\d+)", str(ks_dir)).group(1))
             cluster_group = pd.read_csv(ks_dir / "cluster_group.tsv", sep='\t')
             cluster_contam = pd.read_csv(ks_dir / "cluster_ContamPct.tsv", sep='\t')
@@ -1732,7 +1744,7 @@ class SE:
             loudness.append(loud)
         return loudness
     
-    def plot_driftmap(self, num_points: int = 300000, plot_tasks: bool = True, plot_motion: bool = True) -> Dict[int, Tuple[plt.Figure, plt.Axes]]:
+    def plot_driftmap(self, num_points: int = 300000, plot_tasks: bool = True, plot_motion: bool = True, color_clusters: bool = False) -> Dict[int, Tuple[plt.Figure, plt.Axes]]:
         """
         Plots drift maps for each probe directory in `self.ks_dirs`.
         This method visualizes the drift of neural recordings over time for each probe. 
@@ -1746,6 +1758,8 @@ class SE:
                 Defaults to True.
             plot_motion (bool, optional): If True, overlays motion correction data on the plots.
                 Defaults to True.
+            color_clusters (bool, optional): If True, colors the spikes by their cluster IDs rather than using amplitudes.
+                Defaults to False.
         Returns:
             Dict[int, Tuple[plt.Figure, plt.Axes]]: A dictionary where the keys are probe numbers 
             (extracted from the directory names) and the values are tuples containing the Matplotlib 
@@ -1755,6 +1769,7 @@ class SE:
                 - `spike_times.npy`: Spike times in samples.
                 - `spike_clusters.npy`: Cluster IDs for each spike.
                 - `spike_positions.npy`: Spike positions, where the second column represents depths.
+                - `amplitudes.npy`: Spike amplitudes, if available.
                 - `ops.npy` (optional): Contains metadata such as sampling frequency (`fs`), 
                   drift correction data (`dshift`), and time bounds (`tmin`, `tmax`).
             - If `ops.npy` is not found, a default sampling frequency of 30,000 Hz is used.
@@ -1768,9 +1783,15 @@ class SE:
             # Search for the imec probe number
             probe_num = int(re.search(r"imec(\d+)", str(probe_dir)).group(1))
             ops_dir = probe_dir / "ops.npy"
-            spike_times = np.load(probe_dir / "spike_times.npy")
-            spike_clusters = np.load(probe_dir / "spike_clusters.npy")
-            depths = np.load(probe_dir / "spike_positions.npy")[:, 1]
+            spike_times = np.load(probe_dir / "spike_times.npy").flatten()
+            spike_clusters = np.load(probe_dir / "spike_clusters.npy").flatten()
+            spike_amps = np.load(probe_dir / "amplitudes.npy").flatten()
+            if (probe_dir / "spike_positions.npy").exists():
+                depths = np.load(probe_dir / "spike_positions.npy")[:, 1]
+            elif (probe_dir / "spike_centroids.npy").exists():
+                depths = np.load(probe_dir / "spike_centroids.npy")[:, 1]
+            else:
+                raise FileNotFoundError(f"Neither spike_positions.npy nor spike_centroids.npy found in {probe_dir}.")
             if not ops_dir.exists():
                 fs = 30000 # TODO : change this for KS 2.5
             else:
@@ -1782,18 +1803,41 @@ class SE:
                     dshift[:,i] = -dshift[:,i] + depth_bins[i]
             
             spike_times = spike_times / fs
-            # Reduce spike_times, depths, and spike_clusters to display at most 10,000 points
+            # Reduce spike_times, depths, and spike_clusters to display at most num_points
+
+            # Keep the indices of spike_amps > 8 and spike_amps < 100
+            if not color_clusters:
+                non_noise_indices = np.where((spike_amps > 8) & (spike_amps < 100))[0]
+                spike_times = spike_times[non_noise_indices]
+                depths = depths[non_noise_indices]
+                spike_clusters = spike_clusters[non_noise_indices]
+                spike_amps = spike_amps[non_noise_indices]
+
             if len(spike_times) > num_points:
                 indices = np.random.choice(len(spike_times), num_points, replace=False)
                 spike_times = spike_times[indices]
                 depths = depths[indices]
                 spike_clusters = spike_clusters[indices]
+                spike_amps = spike_amps[indices] 
             
-            ax.scatter(spike_times, depths,
-                       c=spike_clusters % 20,
-                       cmap='tab20',
-                       alpha=0.5,
-                       s=2, rasterized=True)
+            if color_clusters:
+                ax.scatter(spike_times, depths,
+                        c=spike_clusters % 20,
+                        cmap='tab20',
+                        alpha=0.5,
+                        s=2, rasterized=True)
+            else:
+                spike_amps = np.maximum(0, 1 - spike_amps / 40)
+                sorted_indices = np.argsort(spike_amps)[::-1]
+                spike_times = spike_times[sorted_indices]
+                depths = depths[sorted_indices]
+                spike_amps = spike_amps[sorted_indices]
+
+                color_rgb = np.column_stack([spike_amps] * 3)
+                ax.scatter(spike_times, depths,
+                           c=color_rgb, # Normalize amplitudes to [0, 1] and use black to white colormap
+                           alpha=0.5,
+                           s=2, rasterized=True)
             
             if ops_dir.exists() and plot_motion:
                 ax.plot(dshift_sec, dshift, color='black', linewidth=1)
