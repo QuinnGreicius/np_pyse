@@ -449,9 +449,9 @@ class SE:
             raise ValueError("Invalid value for which_artics. Choose 'old', 'new', or 'merged'.")
 
         if not velocity:
-            ouput = ouput.drop(columns=[col for col in ouput.columns if col.endswith('_vel')])
+            ouput = ouput.drop(columns=[col for col in ouput.columns if col.startswith('d_')])
         if not acceleration:
-            ouput = ouput.drop(columns=[col for col in ouput.columns if col.endswith('_accel')])
+            ouput = ouput.drop(columns=[col for col in ouput.columns if col.startswith('dd_')])
         
         annotations = {
             'tt': 'tongue tip',

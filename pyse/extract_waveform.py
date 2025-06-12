@@ -2,6 +2,113 @@ import numpy as np
 from pathlib import Path
 import os
 
+def read_pyfile(filepath, ignored_chars=[" ", "'", "\"", "\n", "\r"]):
+    from ast import literal_eval as ale
+    '''
+    Reads .py file and returns contents as dictionnary.
+
+    Assumes that file only has "variable=value" pairs, no fucntions etc
+
+    - filepath: str, path to file
+    - ignored_chars: list of characters to remove (only trailing and leading)
+    '''
+    filepath = Path(filepath)
+    assert filepath.exists(), f'{filepath} not found!'
+
+    params={}
+    with open(filepath) as f:
+        for ln in f.readlines():
+            assert '=' in ln, 'WARNING read_pyfile only works for list of variable=value lines!'
+            tmp = ln.split('=')
+            for i, string in enumerate(tmp):
+                string=string.strip("".join(ignored_chars))
+                tmp[i]=string
+            k, val = tmp[0], tmp[1]
+            try: val = ale(val)
+            except: pass
+            params[k]=val
+
+    return params
+
+def read_rezfile(ks_folder):
+    import h5py
+
+    def h5_to_dict(h5obj):
+        if isinstance(h5obj, h5py.Group):  # Group is like a dictionary
+            return {key: h5_to_dict(h5obj[key]) for key in h5obj}
+        elif isinstance(h5obj, h5py.Dataset):  # Dataset is like an array
+            return np.squeeze(np.array(h5obj))
+        else:
+            return h5obj
+    
+    rez_path = ks_folder / 'rez.mat'
+    with h5py.File(rez_path, 'r') as f:
+        rez = h5_to_dict(f['rez'])
+    return rez
+
+def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10):
+    ks_folder = Path(ks_folder)
+    params = read_pyfile(ks_folder / 'params.py')
+    dat_path = ks_folder / 'temp_wh.dat'
+    dtype = np.dtype(params['dtype'])
+    n_channels_dat = params['n_channels_dat']
+    fs = params['sample_rate']
+    offset = params['offset']
+
+    # Read temp_wh as a memmap file
+    filesize_bytes = os.path.getsize(dat_path)
+    n_samples_total = filesize_bytes // np.dtype('int16').itemsize
+    n_timepoints = n_samples_total // int(n_channels_dat)
+    temp_wh = np.memmap(dat_path, dtype=dtype, mode='r', offset=offset, shape=(n_timepoints, n_channels_dat))
+
+    spike_times = np.load(ks_folder / 'spike_times.npy').squeeze()
+    spike_clusters = np.load(ks_folder / 'spike_clusters.npy').squeeze()
+    templates = np.load(ks_folder / 'templates.npy')
+
+    # Check if ops.npy exists
+    ops_path = ks_folder / 'ops.npy'
+    rez_path = ks_folder / 'rez.mat'
+    if ops_path.exists():
+        ops = np.load(ops_path, allow_pickle=True).item()
+        t0 = ops['tmin']
+    elif rez_path.exists():
+        rez = read_rezfile(ks_folder)
+        t0 = rez['ops']['trange'][0]
+    else:
+        raise FileNotFoundError("Neither ops.npy nor rez.mat found in the specified folder.")
+
+    spk_mask = spike_clusters == clus_id
+    spk_idx = spike_times[spk_mask].astype(int)
+
+    chan_best = (templates[clus_id]**2).sum(axis=0).argmax()
+
+    # Define spike-centered time and channel windows
+    t_center = spk_idx - int(t0 * fs)
+    time_window = np.arange(-n_samples, n_samples + 1)  # (2 * n_samples + 1,)
+    channel_window = np.arange(-n_channels // 2, n_channels - n_channels // 2)  # length n_channels
+
+    # Compute 2D index arrays for time and channels
+    time_idx = t_center[:, None] + time_window[None, :]  # (n_spikes, n_window)
+    time_idx_exp = time_idx[:, :, None]  # (n_spikes, n_window, 1)
+    valid_time = (time_idx_exp >= 0) & (time_idx_exp < n_timepoints)
+    time_idx_exp = np.clip(time_idx_exp, 0, n_timepoints - 1) 
+
+    space_idx = chan_best + channel_window  # (n_spikes, n_channels)
+    space_idx_exp = space_idx[None, None, :]  # (1, 1, n_channels)
+    valid_space = (space_idx_exp >= 0) & (space_idx_exp < n_channels_dat)
+    space_idx_exp = np.clip(space_idx_exp, 0, n_channels_dat - 1)  # Ensure indices are within bounds
+    
+    time_idx_broadcasted = np.broadcast_to(time_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
+    space_idx_broadcasted = np.broadcast_to(space_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
+    flat_time_idx = time_idx_broadcasted.reshape(-1)
+    flat_space_idx = space_idx_broadcasted.reshape(-1)
+
+    waveforms_flat = temp_wh[flat_time_idx, flat_space_idx]  # shape: (126*81*10,)
+    waveforms = waveforms_flat.reshape(time_idx.shape[0], time_idx.shape[1], space_idx.shape[0])  # (126, 81, 10)
+    waveforms = waveforms.astype(np.float32)
+    waveforms[~valid_time | ~valid_space] = np.nan
+    return waveforms
+
 # https://github.com/m-beau/NeuroPyxels?tab=readme-ov-file#load-waveforms-from-unit-u
     
 def metadata(dp):

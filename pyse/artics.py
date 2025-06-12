@@ -1,6 +1,38 @@
 import numpy as np
 import pandas as pd
 
+def compute_ja(li_x, li_y, ul_x, ul_y):
+    """
+    Compute jaw aperture from lower incisor and upper lip based on Sivaraman et al. 2019
+    "JA was defined as the Euclidean distance between the UL sensor and the LI sensor"
+    Args:
+        li_x (array-like): x-coordinates of lower incisor.
+        li_y (array-like): y-coordinates of lower incisor.
+        ul_x (array-like): x-coordinates of upper lip.
+        ul_y (array-like): y-coordinates of upper lip.
+    Returns:
+        ja (array-like): Jaw aperture, computed as the Euclidean distance.
+    """
+    return np.sqrt((li_x - ul_x) ** 2 + (li_y - ul_y) ** 2)
+
+def compute_txcc(tx_x, tx_y):
+    """
+    Compute tongue constriction angle in cosine based on Parrot et al. 2019
+    e.g. "TTC: the cosine of the angle of the tongue tip off the horizontal axis"
+    
+    Args:
+        tx_x (array-like): x-coordinates of tongue tip.
+        tx_y (array-like): y-coordinates of tongue tip.
+        
+    Returns:
+        txcc (array-like): Tongue constriction angle in cosine.
+    """
+    # Ensure tx_x and tx_y are numpy arrays
+    tx_x = np.asarray(tx_x)
+    tx_y = np.asarray(tx_y)
+
+    return tx_x / np.sqrt(tx_x**2 + tx_y**2)
+
 def populate_dataframe(artics_dir, artics_df, artic_cols):
     """
     Populates a DataFrame with data from .npy files in a specified directory.
@@ -57,7 +89,16 @@ def populate_dataframe(artics_dir, artics_df, artic_cols):
 
         artics_df = pd.DataFrame(all_rows)
         artics_df = artics_df.sort_values(by='onset').reset_index(drop=True)
+
+        # Compute additional features
+        artics_df['ja'] = artics_df.apply(lambda row: compute_ja(row['li_x'], row['li_y'], row['ul_x'], row['ul_y']), axis=1)
+        artics_df['ttcc'] = artics_df.apply(lambda row: compute_txcc(row['tt_x'], row['tt_y']), axis=1)
+        artics_df['tbcc'] = artics_df.apply(lambda row: compute_txcc(row['tb_x'], row['tb_y']), axis=1)
+        artics_df['tdcc'] = artics_df.apply(lambda row: compute_txcc(row['td_x'], row['td_y']), axis=1)
     return artics_df
+
+
+        
 
 def init_artics_new_df(se: "SE") -> None:
     """
@@ -92,8 +133,8 @@ def init_artics_new_df(se: "SE") -> None:
     artics_new_df = pd.DataFrame(columns=['onset', 'offset'] + artics_new_cols)
     artics_new_df = populate_dataframe(se.artics_new_dir, artics_new_df, artics_new_cols)
     for col in artics_new_cols:
-        artics_new_df[col + '_vel'] = artics_new_df[col].apply(lambda x: np.gradient(x))
-        artics_new_df[col + '_accel'] = artics_new_df[col + '_vel'].apply(lambda x: np.gradient(x))
+        artics_new_df['d_' + col] = artics_new_df[col].apply(lambda x: np.gradient(x))
+        artics_new_df['dd_' + col] = artics_new_df['d_' + col].apply(lambda x: np.gradient(x))
 
     artics_new_df = artics_new_df[['onset', 'offset'] + [col for col in artics_new_df.columns if col not in ['onset', 'offset']]]
     se.artics_new_df = artics_new_df
@@ -139,9 +180,9 @@ def init_artics_old_df(se: "SE") -> None:
     artics_old_df = pd.DataFrame(columns=['onset', 'offset'] + artics_old_cols)
     artics_old_df = populate_dataframe(se.artics_old_dir, artics_old_df, artics_old_cols)
     for col in artics_old_cols:
-        artics_old_df[col + '_vel'] = artics_old_df[col].apply(lambda x: np.gradient(x))
-        artics_old_df[col + '_accel'] = artics_old_df[col + '_vel'].apply(lambda x: np.gradient(x))
-        
+        artics_old_df['d_' + col] = artics_old_df[col].apply(lambda x: np.gradient(x))
+        artics_old_df['dd_' + col] = artics_old_df['d_' + col].apply(lambda x: np.gradient(x))
+
     artics_old_df = artics_old_df[['onset', 'offset'] + [col for col in artics_old_df.columns if col not in ['onset', 'offset']]]
     se.artics_old_df = artics_old_df
 
