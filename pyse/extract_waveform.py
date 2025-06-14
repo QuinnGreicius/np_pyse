@@ -46,13 +46,12 @@ def read_rezfile(ks_folder):
         rez = h5_to_dict(f['rez'])
     return rez
 
-def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10):
+def get_temp_wh(ks_folder):
     ks_folder = Path(ks_folder)
     params = read_pyfile(ks_folder / 'params.py')
     dat_path = ks_folder / 'temp_wh.dat'
     dtype = np.dtype(params['dtype'])
     n_channels_dat = params['n_channels_dat']
-    fs = params['sample_rate']
     offset = params['offset']
 
     # Read temp_wh as a memmap file
@@ -60,26 +59,45 @@ def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10):
     n_samples_total = filesize_bytes // np.dtype('int16').itemsize
     n_timepoints = n_samples_total // int(n_channels_dat)
     temp_wh = np.memmap(dat_path, dtype=dtype, mode='r', offset=offset, shape=(n_timepoints, n_channels_dat))
+    return temp_wh
 
-    spike_times = np.load(ks_folder / 'spike_times.npy').squeeze()
-    spike_clusters = np.load(ks_folder / 'spike_clusters.npy').squeeze()
-    templates = np.load(ks_folder / 'templates.npy')
+def get_fs(ks_folder):
+    params = read_pyfile(ks_folder / 'params.py')
+    return params['sample_rate']
 
+def get_tmin(ks_folder):
     # Check if ops.npy exists
     ops_path = ks_folder / 'ops.npy'
     rez_path = ks_folder / 'rez.mat'
-    if ops_path.exists():
+    if ops_path.exists() and t0 is None:
         ops = np.load(ops_path, allow_pickle=True).item()
-        t0 = ops['tmin']
-    elif rez_path.exists():
+        return ops['tmin']
+    elif rez_path.exists() and t0 is None:
         rez = read_rezfile(ks_folder)
-        t0 = rez['ops']['trange'][0]
+        return rez['ops']['trange'][0]
     else:
         raise FileNotFoundError("Neither ops.npy nor rez.mat found in the specified folder.")
 
+def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10,
+                            spike_times=None, spike_clusters=None, templates=None,
+                            temp_wh=None, fs=None, t0=None):
+    ks_folder = Path(ks_folder)
+    
+    if temp_wh is None:
+        temp_wh = get_temp_wh(ks_folder)
+    if fs is None:
+        fs = get_fs(ks_folder)
+    if t0 is None:
+        t0 = get_tmin(ks_folder)
+    if spike_times is None:
+        spike_times = np.load(ks_folder / 'spike_times.npy').squeeze()
+    if spike_clusters is None:
+        spike_clusters = np.load(ks_folder / 'spike_clusters.npy').squeeze()
+    if templates is None:
+        templates = np.load(ks_folder / 'templates.npy')
+    
     spk_mask = spike_clusters == clus_id
     spk_idx = spike_times[spk_mask].astype(int)
-
     chan_best = (templates[clus_id]**2).sum(axis=0).argmax()
 
     # Define spike-centered time and channel windows
@@ -90,13 +108,13 @@ def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10):
     # Compute 2D index arrays for time and channels
     time_idx = t_center[:, None] + time_window[None, :]  # (n_spikes, n_window)
     time_idx_exp = time_idx[:, :, None]  # (n_spikes, n_window, 1)
-    valid_time = (time_idx_exp >= 0) & (time_idx_exp < n_timepoints)
-    time_idx_exp = np.clip(time_idx_exp, 0, n_timepoints - 1) 
+    valid_time = (time_idx_exp >= 0) & (time_idx_exp < temp_wh.shape[0])
+    time_idx_exp = np.clip(time_idx_exp, 0, temp_wh.shape[0] - 1) 
 
     space_idx = chan_best + channel_window  # (n_spikes, n_channels)
     space_idx_exp = space_idx[None, None, :]  # (1, 1, n_channels)
-    valid_space = (space_idx_exp >= 0) & (space_idx_exp < n_channels_dat)
-    space_idx_exp = np.clip(space_idx_exp, 0, n_channels_dat - 1)  # Ensure indices are within bounds
+    valid_space = (space_idx_exp >= 0) & (space_idx_exp < temp_wh.shape[1])
+    space_idx_exp = np.clip(space_idx_exp, 0, temp_wh.shape[1] - 1)  # Ensure indices are within bounds
     
     time_idx_broadcasted = np.broadcast_to(time_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
     space_idx_broadcasted = np.broadcast_to(space_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
@@ -110,282 +128,14 @@ def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10):
     return waveforms
 
 # https://github.com/m-beau/NeuroPyxels?tab=readme-ov-file#load-waveforms-from-unit-u
-    
-def metadata(dp):
-    '''
-    Read spikeGLX (.ap/lf.meta) or openEphys (.oebin) metadata files
-    and returns their contents as dictionnaries.
-
-    The 'highpass' or 'lowpass' nested dicts correspond to Neuropixels 1.0 high or low pass filtered metadata.
-    2.0 recordings only have a 'highpass' key, as they are acquired as a single file matched with a .ap.meta file.
-        for spikeGLX, corresponds to metadata of .ap.meta and .lf.meta files.
-        for OpenEphys, .oebin metadata relating to the first and second dictionnaries in 'continuous' of the .oebin file
-                       which match the /continuous/Neuropix-PXI-100.0 or .1 folders respectively.
-
-    Arguments:
-        - dp: str, datapath to spike sorted dataset
-
-    Returns:
-        - meta: dictionnary containing contents of meta file.
-        the structure of meta is as follow:
-        {
-        'probe_version': either of '3A', '1.0_staggered', '2.0_1shank', '2.0_4shanks', 'ultra_high_density';
-        'highpass':
-            {
-            'binary_relative_path':relative path to binary file from dp,
-            'sampling_rate':int, # sampling rate
-            'n_channels_binaryfile':int, # n channels saved on file, typically 385 for .bin and 384 for .dat
-            'n_channels_analysed':int, # n channels used for spikesorting. Will set the shape of temp_wh.daat for kilosort.
-            'datatype':str, # datatype of binary encoding, typically int16
-            'binary_relative_path':relative path to binary file from dp,
-            'key1...': all other keys present in meta file, that you must be familiar with!
-                       e.g. 'fileSizeBytes' for spikeGLX or 'channels' for OpenEphys...
-            },
-        'lowpass': {...}, # same as high for low pass filtered data (not existing in 2.0 recordings)
-        'events': {...}, # only for openephys recordings, contents of oebin file
-        'spikes': {...} # only for openephys recordings, contents of oebin file
-        }
-    '''
-    dp = Path(dp)
-    assert dp.exists(), "Provided path does not exist!"
-    assert dp.is_dir(), f"Provided path {dp} is a filename!"
-
-    probe_versions = {
-        'glx':{3.0:  '3A', # option 3
-               0.0:  '1.0',
-               1.0:  '1.0', # precise type unknown
-
-               1020:  '1.0', # precise type unknown
-               1100:  '1.0', # precise type unknown
-               1200:  '1.0', # precise type unknown
-               1300:  '1.0', # precise type unknown
-
-               1110:  '1.0', # precise type unknown
-               1120:  '1.0', # precise type unknown
-               1121:  '1.0', # precise type unknown
-               1122:  '1.0', # precise type unknown
-               1123:  'ultra_high_density',
-
-               1030: 'NHP_1.0',
-
-               21:   '2.0_singleshank',
-               2003: '2.0_singleshank',
-               2004: '2.0_singleshank',
-
-               24:   '2.0_fourshanks',
-               2013: '2.0_fourshanks',
-               2014: '2.0_fourshanks', # assumed type
-               2020: '2.0_fourshanks', # assuned type
-               },
-        'oe':{"Neuropix-3a":'3A', # source_processor_name keys
-                "Neuropix-PXI":'1.0',
-                '?1':'2.0_singleshank', # do not know yet
-                '?2':'2.0_fourshanks'}, # do not know yet
-        'int':{'3A':1,
-               '1.0':1,
-               'NHP_1.0':1,
-               '2.0_singleshank':2,
-               '2.0_fourshanks':2,
-               'ultra_high_density':3}
-        }
-
-    # import params.py data
-    params_f = dp/'params.py'
-    if params_f.exists():
-        params=read_pyfile(dp/'params.py')
-
-    # find meta file
-    glx_ap_files = list_files(dp, "ap.meta", True)
-    glx_lf_files = list_files(dp, "lf.meta", True)
-    oe_files = list_files(dp, "oebin", True)
-    glx_found = np.any(glx_ap_files) or np.any(glx_lf_files)
-    oe_found = np.any(oe_files)
-    assert glx_found or oe_found, \
-        f'WARNING no .ap/lf.meta (spikeGLX) or .oebin (OpenEphys) file found at {dp}.'
-    assert not (glx_found and oe_found),\
-        'WARNING dataset seems to contain both an open ephys and spikeGLX metafile - fix this!'
-    assert len(glx_ap_files)==1 or len(glx_lf_files)==1 or len(oe_files)==1,\
-        'WARNING more than 1 .ap.meta or 1 .oebin files found!'
-
-    # Formatting of openephys meta file
-    meta = {}
-    meta['path'] = os.path.realpath(dp)
-    if oe_found:
-        meta['acquisition_software']='OpenEphys'
-        # Load OpenEphys metadata
-        metafile=Path(oe_files[0])
-        with open(metafile) as f:
-            meta_oe = json.load(f)
-
-        # find probe version
-        for i,processor in enumerate(meta_oe['continuous']):
-            if 'Neuropix-PXI' in processor["source_processor_name"]:
-                probe_index = i
-                break
-        oe_probe_version = meta_oe["continuous"][probe_index]["source_processor_name"]
-        assert oe_probe_version in probe_versions['oe'].keys(),\
-            f'WARNING only probe version {oe_probe_version} not handled with openEphys - post an issue at www.github.com/m-beau/NeuroPyxels'
-        meta['probe_version']=probe_versions['oe'][oe_probe_version]
-        meta['probe_version_int'] = probe_versions['int'][meta['probe_version']]
-
-        # Find conversion factor
-        # should be 0.19499999284744262695
-        meta['bit_uV_conv_factor']=meta_oe["continuous"][probe_index]["channels"][0]["bit_volts"]
-
-        # index for highpass and lowpass
-        filt_index = {'highpass': [], 'lowpass': []}
-        for i,processor in enumerate(meta_oe['continuous']):
-            if 'AP' in processor['folder_name']:
-                filt_index['highpass'] = i
-            if 'LFP' in processor['folder_name']:
-                filt_index['lowpass'] = i
-
-
-        # find everything else
-        for filt_key in ['highpass','lowpass']:
-            meta[filt_key]={}
-            filt_key_i=filt_index[filt_key]
-            meta[filt_key]['sampling_rate']=float(meta_oe["continuous"][filt_key_i]['sample_rate'])
-            meta[filt_key]['n_channels_binaryfile']=int(meta_oe["continuous"][filt_key_i]['num_channels'])
-            if params_f.exists():
-                meta[filt_key]['n_channels_analysed']=params['n_channels_dat']
-                meta[filt_key]['datatype']=params['dtype']
-            else:
-                meta[filt_key]['n_channels_analysed']=meta[filt_key]['n_channels_binaryfile']
-                meta[filt_key]['datatype']='int16'
-            binary_folder = './continuous/'+meta_oe["continuous"][filt_key_i]['folder_name']
-            binary_file = list_files(dp/binary_folder, "dat", False)
-            if any(binary_file):
-                binary_rel_path = binary_folder+binary_file[0]
-                meta[filt_key]['binary_relative_path']=binary_rel_path
-                meta[filt_key]['binary_byte_size']=os.path.getsize(dp/binary_rel_path)
-                if filt_key=='highpass' and params_f.exists() and params['dat_path']!=binary_rel_path:
-                    print((f'\033[34;1mWARNING edit dat_path in params.py '
-                    f'so that it matches relative location of high pass filtered binary file: {binary_rel_path}'))
-            else:
-                meta[filt_key]['binary_relative_path']='not_found'
-                meta[filt_key]['binary_byte_size']='unknown'
-                print(f"\033[91;1mWARNING {filt_key} binary file not found at {dp}\033[0m")
-            meta[filt_key]={**meta[filt_key], **meta_oe["continuous"][filt_key_i]}
-        meta["events"]=meta_oe["events"]
-        meta["spikes"]=meta_oe["spikes"]
-
-
-    # Formatting of SpikeGLX meta file
-    elif glx_found:
-        meta['acquisition_software']='SpikeGLX'
-        # Load SpikeGLX metadata
-        meta_glx = {}
-        for metafile in glx_ap_files+glx_lf_files:
-            if metafile in glx_ap_files: filtkey='highpass'
-            elif metafile in glx_lf_files: filtkey='lowpass'
-            metafile=Path(metafile)
-            meta_glx[filtkey]={}
-            with open(metafile, 'r') as f:
-                for ln in f.readlines():
-                    tmp = ln.split('=')
-                    k, val = tmp[0], ''.join(tmp[1:])
-                    k = k.strip()
-                    val = val.strip('\r\n')
-                    if '~' in k:
-                        meta_glx[filtkey][k] = val.strip('(').strip(')').split(')(')
-                    else:
-                        try:  # is it numeric?
-                            meta_glx[filtkey][k] = float(val)
-                        except:
-                            meta_glx[filtkey][k] = val
-
-        # find probe version
-        if 'imProbeOpt' in meta_glx["highpass"]: # 3A
-            glx_probe_version = meta_glx["highpass"]["imProbeOpt"]
-        elif 'imDatPrb_type' in meta_glx["highpass"]: # 1.0 and beyond
-            glx_probe_version = meta_glx["highpass"]["imDatPrb_type"]
-        else:
-             glx_probe_version = 'N/A'
-
-        if glx_probe_version in probe_versions['glx']:
-            meta['probe_version'] = probe_versions['glx'][glx_probe_version]
-            meta['probe_version_int'] = probe_versions['int'][meta['probe_version']]
-        else:
-            print(f'WARNING probe version {glx_probe_version} not handled - post an issue at www.github.com/m-beau/NeuroPyxels and provide your .ap.meta file.')
-            meta['probe_version'] = glx_probe_version
-            meta['probe_version_int'] = 0
-            
-
-        # Based on probe version,
-        # Find the voltage range, gain, encoding
-        # and deduce the conversion from units/bit to uV
-        Vrange=(meta_glx["highpass"]['imAiRangeMax']-meta_glx["highpass"]['imAiRangeMin'])*1e6
-        if meta['probe_version'] in ['3A', '1.0', 'ultra_high_density', 'NHP_1.0']:
-            if Vrange!=1.2e6: print(f'\u001b[31mHeads-up, the voltage range seems to be {Vrange}, which is not the default (1.2*10^6). Might be normal!')
-            bits_encoding=10
-            ampFactor=ale(meta_glx["highpass"]['~imroTbl'][1].split(' ')[3]) # typically 500
-            #if ampFactor!=500: print(f'\u001b[31mHeads-up, the voltage amplification factor seems to be {ampFactor}, which is not the default (500). Might be normal!')
-        elif meta['probe_version'] in ['2.0_singleshank', '2.0_fourshanks']:
-            if Vrange!=1e6:
-                print(f'\u001b[31mHeads-up, the voltage range seems to be {Vrange}, which is not the default (10^6). Might be normal!')
-            bits_encoding=14
-            ampFactor=80 # hardcoded
-        else:
-            raise ValueError(f"Probe version unhandled - bits_encoding unknown.")
-        meta['bit_uV_conv_factor']=(Vrange/2**bits_encoding/ampFactor)
-
-
-        # find everything else
-        for filt_key in ['highpass','lowpass']:
-            if filt_key not in meta_glx.keys(): continue
-            meta[filt_key]={}
-
-            # binary file
-            filt_suffix={'highpass':'ap','lowpass':'lf'}[filt_key]
-            binary_rel_path = get_binary_file_path(dp, filt_suffix, False)
-            if binary_rel_path!='not_found':
-                meta[filt_key]['binary_byte_size']=os.path.getsize(dp/binary_rel_path)
-                meta[filt_key]['binary_relative_path']='./'+binary_rel_path
-            else:
-                meta[filt_key]['binary_byte_size']='unknown'
-                meta[filt_key]['binary_relative_path']=binary_rel_path
-                #print(f"\033[91;1mWARNING binary file .{filt_suffix}.bin not found at {dp}\033[0m")
-
-            # sampling rate
-            if meta_glx[filt_key]['typeThis'] == 'imec':
-                meta[filt_key]['sampling_rate']=float(meta_glx[filt_key]['imSampRate'])
-            else:
-                meta[filt_key]['sampling_rate']=float(meta_glx[meta_glx['typeThis'][:2]+'SampRate'])
-
-            meta[filt_key]['n_channels_binaryfile']=int(meta_glx[filt_key]['nSavedChans'])
-            if params_f.exists():
-                meta[filt_key]['n_channels_analysed']=params['n_channels_dat']
-                meta[filt_key]['datatype']=params['dtype']
-            else:
-                meta[filt_key]['n_channels_analysed']=meta[filt_key]['n_channels_binaryfile']
-                meta[filt_key]['datatype']='int16'
-            meta[filt_key]={**meta[filt_key], **meta_glx[filt_key]}
-
-    # Calculate length of recording
-    high_fs = meta['highpass']['sampling_rate']
-
-    if meta['highpass']['binary_byte_size']=='unknown':
-        if (dp/'spike_times.npy').exists():
-            t_end=np.load(dp/'spike_times.npy').ravel()[-1]
-            meta['recording_length_seconds']=t_end/high_fs
-        else:
-            meta['recording_length_seconds'] = 'unkown'
-    else:
-        file_size = meta['highpass']['binary_byte_size']
-        item_size = np.dtype(meta['highpass']['datatype']).itemsize
-        nChans = meta['highpass']['n_channels_binaryfile']
-        meta['recording_length_seconds'] = file_size/item_size/nChans/high_fs
-
-    return meta
-
-def get_waveforms(dp, u, n_waveforms=100, t_waveforms=82, selection='regular', periods='all',
+def get_raw_waveforms(dp, u, n_waveforms=100, t_waveforms=82, selection='regular', periods='all',
                   spike_ids=None, wvf_batch_size=10, ignore_nwvf=True,
                   whiten=0, med_sub=0, hpfilt=0, hpfiltf=300,
                   nRangeWhiten=None, nRangeMedSub=None, ignore_ks_chanfilt=True, verbose=False,
                   med_sub_in_time=True, return_corrupt_mask=False, again=False,
                   cache_results=True, cache_path=None):
 
+    raise NotImplementedError("This function is a work in progress. Please use the whitened_waveforms for now.")
     # Extract and process metadata
     dp             = Path(dp)
     meta           = read_metadata(dp)

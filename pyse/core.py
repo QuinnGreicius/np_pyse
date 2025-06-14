@@ -1,6 +1,6 @@
 import numpy as np
 from pathlib import Path
-from . import syllabify, textgrid, enrich_features, artics
+from . import syllabify, textgrid, enrich_features, artics, extract_waveform
 import librosa
 import soundfile as sf
 import glob
@@ -1110,20 +1110,27 @@ class SE:
         df = pd.DataFrame(columns=['spike_time', 'spike_cluster', 'spike_amplitude', 'depth', 'probe'])
         for ks_dir in self.ks_dirs:
             # if ops.npy exists, find the sample rate from there
-            ops_path = ks_dir / "ops.npy"
-            if ops_path.exists():
-                ops = np.load(ops_path, allow_pickle=True).item()
-                sample_rate = ops['fs']
-            else:
-                sample_rate = 30000 # TODO : change this to read from the metadata
+            sample_rate = extract_waveform.get_sample_rate(ks_dir)
 
-            spike_times = np.load(ks_dir / "spike_times.npy").flatten() / sample_rate
-            spike_clusters = np.load(ks_dir / "spike_clusters.npy").flatten()
+            spike_indices = np.load(ks_dir / "spike_times.npy").squeeze()
+            spike_times = spike_indices / sample_rate  # Convert spike indices to seconds
+            spike_clusters = np.load(ks_dir / "spike_clusters.npy").squeeze()
+
+            #temp_wh = extract_waveform.get_temp_wh(ks_dir)
+            
             # Try loading spike positions, if it fails, try loading spike_centroids.npy
             if (ks_dir / "spike_positions.npy").exists():
                 depths = np.load(ks_dir / "spike_positions.npy")
             elif (ks_dir / "spike_centroids.npy").exists():
                 depths = np.load(ks_dir / "spike_centroids.npy")
+            elif (ks_dir / "rez.mat").exists():
+                print("Warning: No depth information calculated. Using estimated depths from channel positions.")
+                rez = extract_waveform.read_rezfile(ks_dir)
+                iTemp = np.load(ks_dir / "spike_templates.npy").squeeze() # Load spike templates
+                iChan = (rez['iNeighPC'][iTemp, 15] - 1).astype(int)  # Get the channel index for the 16th neighbor
+                xcoords = rez['xcoords'][iChan]
+                ycoords = rez['ycoords'][iChan] # Calculate depths from the ycoords of the channels
+                depths = np.column_stack((xcoords, ycoords))
             else:
                 raise FileNotFoundError(f"Neither spike_positions.npy nor spike_centroids.npy found in {ks_dir}.")
             
@@ -1190,6 +1197,7 @@ class SE:
         neuron_df['psth'] = smoothed_psths
         
         neuron_df['time'] = [time for _ in range(len(neuron_df))]
+        neuron_df['num_spikes'] = neuron_df['spike_time'].apply(len)
 
         # # Upsample the PSTH to 1000 Hz
         # new_bin_size = 0.001  # 1 ms in seconds
@@ -1780,31 +1788,54 @@ class SE:
         for probe_dir in self.ks_dirs:
             fig, ax = plt.subplots(figsize=(10, 5))
             probe_dir = Path(probe_dir)
-            # Search for the imec probe number
-            probe_num = int(re.search(r"imec(\d+)", str(probe_dir)).group(1))
-            ops_dir = probe_dir / "ops.npy"
-            spike_times = np.load(probe_dir / "spike_times.npy").flatten()
-            spike_clusters = np.load(probe_dir / "spike_clusters.npy").flatten()
-            spike_amps = np.load(probe_dir / "amplitudes.npy").flatten()
-            if (probe_dir / "spike_positions.npy").exists():
-                depths = np.load(probe_dir / "spike_positions.npy")[:, 1]
-            elif (probe_dir / "spike_centroids.npy").exists():
-                depths = np.load(probe_dir / "spike_centroids.npy")[:, 1]
-            else:
-                raise FileNotFoundError(f"Neither spike_positions.npy nor spike_centroids.npy found in {probe_dir}.")
-            if not ops_dir.exists():
-                fs = 30000 # TODO : change this for KS 2.5
-            else:
+            probe_num = int(re.search(r"imec(\d+)", str(probe_dir)).group(1)) # Search for the imec probe number
+
+            ops_dir = probe_dir / "ops.npy" # Kilosort4 ops file
+            rez_dir = probe_dir / "rez.mat" # Kilosort2.5 rez file
+
+            if rez_dir.exists():
+                rez = extract_waveform.read_rezfile(probe_dir)
+                ops, dshift = rez['ops'], rez['dshift'].T
+                min_time, max_time, fs = ops['trange'][0], ops['trange'][1], float(rez['ops']['fs'])
+
+                if 'st0' in rez.keys() and not color_clusters:
+                    st0 = rez['st0']
+                    spike_times = st0[0, :].flatten() / fs
+                    spike_clusters = np.zeros_like(spike_times, dtype=int)  # No cluster info in st0
+                    spike_amps = st0[2, :].flatten()
+                    depths = st0[1, :].flatten()
+
+                else: # We either want to color clusters or all spikes detected is not available
+                    spike_times = np.load(probe_dir / "spike_times.npy").flatten() / fs
+                    spike_clusters = np.load(probe_dir / "spike_clusters.npy").flatten()
+                    spike_amps = np.load(probe_dir / "amplitudes.npy").flatten()
+
+                    if (probe_dir / "spike_centroids.npy").exists():
+                        depths = np.load(probe_dir / "spike_centroids.npy")[:, 1] # Use the calculated centroids
+                    else:
+                        iTemp = np.load(probe_dir / "spike_templates.npy").flatten() # Load spike templates
+                        iChan = (rez['iNeighPC'][iTemp, 15] - 1).astype(int)  # Get the channel index for the 16th neighbor
+                        depths = rez['ycoords'][iChan] # Calculate depths from the ycoords of the channels
+                
+                dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
+                depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
+                for i in range(dshift.shape[1]):
+                    dshift[:,i] = -dshift[:,i] + depth_bins[i]   
+
+            elif ops_dir.exists():
                 ops = np.load(probe_dir / "ops.npy", allow_pickle=True).item()
                 min_time, max_time, fs, dshift = ops['tmin'], ops['tmax'], ops['fs'], ops['dshift']
+
+                spike_times = np.load(probe_dir / "spike_times.npy").flatten() / fs
+                spike_clusters = np.load(probe_dir / "spike_clusters.npy").flatten()
+                spike_amps = np.load(probe_dir / "amplitudes.npy").flatten()
+                depths = np.load(probe_dir / "spike_positions.npy")[:, 1]
+                
                 dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
                 depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
                 for i in range(dshift.shape[1]):
                     dshift[:,i] = -dshift[:,i] + depth_bins[i]
             
-            spike_times = spike_times / fs
-            # Reduce spike_times, depths, and spike_clusters to display at most num_points
-
             # Keep the indices of spike_amps > 8 and spike_amps < 100
             if not color_clusters:
                 non_noise_indices = np.where((spike_amps > 8) & (spike_amps < 100))[0]
@@ -1813,6 +1844,7 @@ class SE:
                 spike_clusters = spike_clusters[non_noise_indices]
                 spike_amps = spike_amps[non_noise_indices]
 
+            # Reduce spike_times, depths, and spike_clusters to display at most num_points
             if len(spike_times) > num_points:
                 indices = np.random.choice(len(spike_times), num_points, replace=False)
                 spike_times = spike_times[indices]
@@ -1839,7 +1871,7 @@ class SE:
                            alpha=0.5,
                            s=2, rasterized=True)
             
-            if ops_dir.exists() and plot_motion:
+            if plot_motion:
                 ax.plot(dshift_sec, dshift, color='black', linewidth=1)
             if self.task_timings is not None and plot_tasks:
                 for task, start, end in self.task_timings:
@@ -1850,7 +1882,8 @@ class SE:
                              verticalalignment='center', 
                              fontsize=12, 
                              color='black')
-            ax.set_title(f"Probe {probe_num} (Yield: {len(np.unique(spike_clusters))} units)")
+                    
+            ax.set_title(f"Probe {probe_num} (Yield: {len(np.unique(np.load(probe_dir / 'spike_clusters.npy').flatten()))} units)")
             ax.set_xlabel('Time (seconds)')
             ax.set_ylabel('Distance from probe tip (μm)')
             probe_dict[probe_num] = (fig, ax)
