@@ -1069,7 +1069,69 @@ class SE:
         table = table.merge(new_table[['audio', 'mel_spectrogram', 'pitch', 'loudness']], left_index=True, right_index=True, how='left')
         return table, sr
 
-    def get_neuron_df(self, recalculate: bool = False, bin_size: float = 0.010) -> pd.DataFrame:
+    def calculate_waveforms(self, ks_dir: Path, n_spikes: int = None, n_samples: int = 80, n_channels: int = 50, n_jobs: int = 8, use_memmap: bool = True) -> None:
+        """
+        In the ks_dir, calculate the waveforms for each of the clusters, and create an array of shape (len(spike_clusters), n_samples, n_channels)
+
+        """
+        spike_indices = np.load(ks_dir / "spike_times.npy").squeeze()
+        spike_clusters = np.load(ks_dir / "spike_clusters.npy").squeeze()
+        templates = np.load(ks_dir / "templates.npy")
+        channel_map = np.load(ks_dir / "channel_map.npy").squeeze()
+        channel_positions = np.load(ks_dir / "channel_positions.npy")
+
+        temp_wh = extract_waveform.get_temp_wh(ks_dir, use_memmap=use_memmap)
+        t0 = extract_waveform.get_tmin(ks_dir)
+        sample_rate = extract_waveform.get_sample_rate(ks_dir)
+
+        shared_args = {
+            'ks_folder': ks_dir,
+            'n_samples': n_samples,
+            'n_channels': n_channels,
+            'spike_times': spike_indices,
+            'spike_clusters': spike_clusters,
+            'templates': templates,
+            'temp_wh': temp_wh,
+            'fs': sample_rate,
+            't0': t0,
+            'channel_positions': channel_positions,
+            'channel_map': channel_map,
+            'n_spikes': n_spikes
+        }
+
+        unique_clusters = np.unique(spike_clusters)
+
+        if n_jobs > 0:
+            from joblib import Parallel, delayed
+
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(extract_waveform.read_whitened_waveforms)(clus_id=clus_id, **shared_args)
+                for clus_id in tqdm(unique_clusters)
+            )
+        else:
+            results = [
+                extract_waveform.read_whitened_waveforms(clus_id=clus_id, **shared_args)
+                for clus_id in tqdm(unique_clusters)
+            ]
+        
+        # clear temp_wh from memory
+        del temp_wh
+
+        cluster_indices = [np.where(spike_clusters == clus_id) for clus_id in unique_clusters]
+
+        waveforms = np.empty((len(spike_clusters), n_samples, n_channels), dtype=np.float32)
+        for i, result in enumerate(results):
+            if result is not None:
+                waveforms[cluster_indices[i], :, :] = result
+            else:
+                # If no waveform was found for this cluster, fill with NaN
+                waveforms[cluster_indices[i], :, :] = np.nan
+
+        # Save the waveforms to a .npy file called 'waveforms.npy' in the ks_dir
+        np.save(ks_dir / "waveforms.npy", waveforms)
+
+    def get_neuron_df(self, recalculate: bool = False, bin_size: float = 0.010, add_cluster_metadata = False, calculate_waveforms: bool = False, 
+                      n_spikes: int = None, n_samples: int = 80, n_channels: int = 10, n_jobs: int = 8) -> pd.DataFrame:
         """
         Generate and return a DataFrame containing neuron-related data.
 
@@ -1082,6 +1144,9 @@ class SE:
                                 If False, returns the cached DataFrame if available.
             bin_size (float): The size of the time bins for PSTH computation (in seconds).
                                 Default is 0.010 (10 ms).
+            calculate_waveforms (bool): If True, computes the waveforms for each neuron.
+            n_samples (int): Number of samples to extract for each waveform.
+            n_channels (int): Number of channels to consider for waveform extraction.
 
         Returns:
             pd.DataFrame: A DataFrame with the following columns:
@@ -1107,6 +1172,7 @@ class SE:
         """
         if hasattr(self, 'neuron_df') and self.neuron_df is not None and not recalculate:
             return self.neuron_df.copy()
+        
         df = pd.DataFrame(columns=['spike_time', 'spike_cluster', 'spike_amplitude', 'depth', 'probe'])
         for ks_dir in self.ks_dirs:
             # if ops.npy exists, find the sample rate from there
@@ -1115,8 +1181,9 @@ class SE:
             spike_indices = np.load(ks_dir / "spike_times.npy").squeeze()
             spike_times = spike_indices / sample_rate  # Convert spike indices to seconds
             spike_clusters = np.load(ks_dir / "spike_clusters.npy").squeeze()
-
-            #temp_wh = extract_waveform.get_temp_wh(ks_dir)
+            templates = np.load(ks_dir / "templates.npy")
+            channel_map = np.load(ks_dir / "channel_map.npy").squeeze()
+            channel_positions = np.load(ks_dir / "channel_positions.npy")
             
             # Try loading spike positions, if it fails, try loading spike_centroids.npy
             if (ks_dir / "spike_positions.npy").exists():
@@ -1133,17 +1200,10 @@ class SE:
                 depths = np.column_stack((xcoords, ycoords))
             else:
                 raise FileNotFoundError(f"Neither spike_positions.npy nor spike_centroids.npy found in {ks_dir}.")
-            
+
             depths = depths[:, 1] # Assuming depth is in the second column
             amplitudes = np.load(ks_dir / "amplitudes.npy").flatten()
             probe = int(re.search(r"imec(\d+)", str(ks_dir)).group(1))
-            cluster_group = pd.read_csv(ks_dir / "cluster_group.tsv", sep='\t')
-            cluster_contam = pd.read_csv(ks_dir / "cluster_ContamPct.tsv", sep='\t')
-            cluster_amplitude = pd.read_csv(ks_dir / "cluster_Amplitude.tsv", sep='\t')
-
-            # Merge all cluster-level metadata on 'cluster_id'
-            cluster_metadata = cluster_group.merge(cluster_contam, on='cluster_id') \
-                                            .merge(cluster_amplitude, on='cluster_id')
 
             # Create spike-level DataFrame
             spike_df = pd.DataFrame({
@@ -1154,11 +1214,61 @@ class SE:
                 'probe': probe
             })
 
-            # Merge cluster-level metadata onto spike-level data
-            spike_df = spike_df.merge(cluster_metadata, left_on='spike_cluster', right_on='cluster_id', how='left')
+            if add_cluster_metadata:
+                cluster_group = pd.read_csv(ks_dir / "cluster_group.tsv", sep='\t')
+                cluster_contam = pd.read_csv(ks_dir / "cluster_ContamPct.tsv", sep='\t')
+                cluster_amplitude = pd.read_csv(ks_dir / "cluster_Amplitude.tsv", sep='\t')
 
-            # Optional: drop 'cluster_id' if it's redundant
-            spike_df = spike_df.drop(columns='cluster_id')
+                # Merge all cluster-level metadata on 'cluster_id'
+                cluster_metadata = cluster_group.merge(cluster_contam, on='cluster_id') \
+                                                .merge(cluster_amplitude, on='cluster_id')
+
+                
+
+                spike_df = spike_df.merge(cluster_metadata, left_on='spike_cluster', right_on='cluster_id', how='left')
+                # Optional: drop 'cluster_id' if it's redundant
+                spike_df = spike_df.drop(columns='cluster_id')
+
+            if calculate_waveforms:
+                unique_clusters = np.unique(spike_clusters)
+                if ks_dir / "waveforms.npy" in ks_dir.iterdir():
+                    waveforms = np.load(ks_dir / "waveforms.npy")
+                    results = [waveforms[spike_clusters == clus_id] for clus_id in unique_clusters]
+                    print("Using precomputed waveforms from waveforms.npy")
+                else:
+                    temp_wh = extract_waveform.get_temp_wh(ks_dir)
+                    t0 = extract_waveform.get_tmin(ks_dir)
+                    shared_args = {
+                        'ks_folder': ks_dir,
+                        'n_samples': n_samples,
+                        'n_channels': n_channels,
+                        'spike_times': spike_indices,
+                        'spike_clusters': spike_clusters,
+                        'templates': templates,
+                        'temp_wh': temp_wh,
+                        'fs': sample_rate,
+                        't0': t0,
+                        'channel_positions': channel_positions,
+                        'channel_map': channel_map,
+                        'n_spikes': n_spikes
+                    }
+                    if n_jobs > 0:
+                        from joblib import Parallel, delayed
+
+                        results = Parallel(n_jobs=n_jobs)(
+                            delayed(extract_waveform.read_whitened_waveforms)(clus_id=clus_id, **shared_args)
+                            for clus_id in tqdm(unique_clusters)
+                        )
+                    else:
+                        results = [
+                            extract_waveform.read_whitened_waveforms(clus_id=clus_id, **shared_args)
+                            for clus_id in tqdm(unique_clusters)
+                        ]
+                        
+                for i, clus_id in enumerate(unique_clusters):
+                    idx = spike_df.index[spike_df['spike_cluster'] == clus_id][0]
+                    spike_df.at[idx, 'waveformMed'] = np.nanmedian(results[i], axis=0)
+                    spike_df.at[idx, 'waveformStd'] = np.nanstd(results[i], axis=0)
 
             # Append to main df
             df = pd.concat([df, spike_df], ignore_index=True)
@@ -1795,8 +1905,9 @@ class SE:
 
             if rez_dir.exists():
                 rez = extract_waveform.read_rezfile(probe_dir)
-                ops, dshift = rez['ops'], rez['dshift'].T
+                ops, dshift = rez['ops'], rez['dshift']
                 min_time, max_time, fs = ops['trange'][0], ops['trange'][1], float(rez['ops']['fs'])
+                dshift = dshift.T if dshift is not None else None
 
                 if 'st0' in rez.keys() and not color_clusters:
                     st0 = rez['st0']
@@ -1816,11 +1927,12 @@ class SE:
                         iTemp = np.load(probe_dir / "spike_templates.npy").flatten() # Load spike templates
                         iChan = (rez['iNeighPC'][iTemp, 15] - 1).astype(int)  # Get the channel index for the 16th neighbor
                         depths = rez['ycoords'][iChan] # Calculate depths from the ycoords of the channels
-                
-                dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
-                depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
-                for i in range(dshift.shape[1]):
-                    dshift[:,i] = -dshift[:,i] + depth_bins[i]   
+
+                if dshift is not None:
+                    dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
+                    depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
+                    for i in range(dshift.shape[1]):
+                        dshift[:,i] = -dshift[:,i] + depth_bins[i]   
 
             elif ops_dir.exists():
                 ops = np.load(probe_dir / "ops.npy", allow_pickle=True).item()
@@ -1831,10 +1943,11 @@ class SE:
                 spike_amps = np.load(probe_dir / "amplitudes.npy").flatten()
                 depths = np.load(probe_dir / "spike_positions.npy")[:, 1]
                 
-                dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
-                depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
-                for i in range(dshift.shape[1]):
-                    dshift[:,i] = -dshift[:,i] + depth_bins[i]
+                if dshift is not None:
+                    dshift_sec = np.linspace(min_time, max_time, dshift.shape[0])
+                    depth_bins = np.linspace(0, np.max(depths), dshift.shape[1])
+                    for i in range(dshift.shape[1]):
+                        dshift[:,i] = -dshift[:,i] + depth_bins[i]
             
             # Keep the indices of spike_amps > 8 and spike_amps < 100
             if not color_clusters:
@@ -1871,7 +1984,7 @@ class SE:
                            alpha=0.5,
                            s=2, rasterized=True)
             
-            if plot_motion:
+            if plot_motion and dshift is not None:
                 ax.plot(dshift_sec, dshift, color='black', linewidth=1)
             if self.task_timings is not None and plot_tasks:
                 for task, start, end in self.task_timings:

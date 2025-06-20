@@ -46,7 +46,7 @@ def read_rezfile(ks_folder):
         rez = h5_to_dict(f['rez'])
     return rez
 
-def get_temp_wh(ks_folder):
+def get_temp_wh(ks_folder, use_memmap=True):
     ks_folder = Path(ks_folder)
     params = read_pyfile(ks_folder / 'params.py')
     dat_path = ks_folder / 'temp_wh.dat'
@@ -58,10 +58,18 @@ def get_temp_wh(ks_folder):
     filesize_bytes = os.path.getsize(dat_path)
     n_samples_total = filesize_bytes // np.dtype('int16').itemsize
     n_timepoints = n_samples_total // int(n_channels_dat)
-    temp_wh = np.memmap(dat_path, dtype=dtype, mode='r', offset=offset, shape=(n_timepoints, n_channels_dat))
+    if use_memmap:
+        # Use memmap to read the file
+        temp_wh = np.memmap(dat_path, dtype=dtype, mode='r', offset=offset, shape=(n_timepoints, n_channels_dat))
+    else:
+        # Read the file directly into a numpy array
+        with open(dat_path, 'rb') as f:
+            f.seek(offset)
+            temp_wh = np.fromfile(f, dtype=dtype, count=n_timepoints * n_channels_dat)
+            temp_wh = temp_wh.reshape((n_timepoints, n_channels_dat))
     return temp_wh
 
-def get_fs(ks_folder):
+def get_sample_rate(ks_folder):
     params = read_pyfile(ks_folder / 'params.py')
     return params['sample_rate']
 
@@ -69,24 +77,45 @@ def get_tmin(ks_folder):
     # Check if ops.npy exists
     ops_path = ks_folder / 'ops.npy'
     rez_path = ks_folder / 'rez.mat'
-    if ops_path.exists() and t0 is None:
+    if ops_path.exists():
         ops = np.load(ops_path, allow_pickle=True).item()
         return ops['tmin']
-    elif rez_path.exists() and t0 is None:
+    elif rez_path.exists():
         rez = read_rezfile(ks_folder)
         return rez['ops']['trange'][0]
     else:
         raise FileNotFoundError("Neither ops.npy nor rez.mat found in the specified folder.")
+    
+def get_nearest_channels_same_x(channel_positions, chan_best, n_channels):
+    x_all = channel_positions[:, 0]
+    y_all = channel_positions[:, 1]
 
-def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10,
+    # Get x and y for each best channel
+    x0 = x_all[chan_best]
+    y0 = y_all[chan_best]
+
+    same_x_mask = (x_all == x0)
+    y_same_x = y_all[same_x_mask]
+    idx_same_x = np.where(same_x_mask)[0]
+
+    # Get distances
+    y_dist = np.abs(y_same_x - y0)
+
+    # Get n closest by y
+    nearest_unordered = np.argpartition(y_dist, kth=n_channels - 1)[:n_channels]
+    sorted_order = np.argsort(-y_same_x[nearest_unordered])
+    return idx_same_x[nearest_unordered[sorted_order]]
+
+def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=80, n_channels=10,
                             spike_times=None, spike_clusters=None, templates=None,
-                            temp_wh=None, fs=None, t0=None):
+                            temp_wh=None, fs=None, t0=None, n_spikes=None, channel_positions=None, 
+                            channel_map=None, seed=0):
     ks_folder = Path(ks_folder)
     
     if temp_wh is None:
         temp_wh = get_temp_wh(ks_folder)
     if fs is None:
-        fs = get_fs(ks_folder)
+        fs = get_sample_rate(ks_folder)
     if t0 is None:
         t0 = get_tmin(ks_folder)
     if spike_times is None:
@@ -95,37 +124,54 @@ def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10,
         spike_clusters = np.load(ks_folder / 'spike_clusters.npy').squeeze()
     if templates is None:
         templates = np.load(ks_folder / 'templates.npy')
-    
+    if channel_positions is None:
+        channel_positions = np.load(ks_folder / 'channel_positions.npy')
+    if channel_map is None:
+        channel_map = np.load(ks_folder / 'channel_map.npy').squeeze()
+
     spk_mask = spike_clusters == clus_id
     spk_idx = spike_times[spk_mask].astype(int)
+
+    if not np.any(spk_mask):
+        return np.empty((0, n_samples, n_channels), dtype=np.float32)
+
     chan_best = (templates[clus_id]**2).sum(axis=0).argmax()
 
     # Define spike-centered time and channel windows
     t_center = spk_idx - int(t0 * fs)
-    time_window = np.arange(-n_samples, n_samples + 1)  # (2 * n_samples + 1,)
-    channel_window = np.arange(-n_channels // 2, n_channels - n_channels // 2)  # length n_channels
+    time_window = np.arange(n_samples) - n_samples // 2 + 1
+    space_idx = get_nearest_channels_same_x(channel_positions, chan_best, n_channels)
+    space_idx = channel_map[space_idx]  # Map to the correct channel indices
+
+    # Limit the number of spikes and randomly sample n_spikes if more spikes are available
+    if n_spikes is not None: 
+        n_spikes = min(n_spikes, len(t_center))
+        if len(t_center) > n_spikes:
+            np.random.seed(seed)
+            indices = np.random.choice(len(t_center), n_spikes, replace=False)
+            t_center = t_center[indices]
+            spk_idx = spk_idx[indices]
+
+    n_spikes, n_samples, n_channels = len(t_center), n_samples, n_channels
 
     # Compute 2D index arrays for time and channels
-    time_idx = t_center[:, None] + time_window[None, :]  # (n_spikes, n_window)
-    time_idx_exp = time_idx[:, :, None]  # (n_spikes, n_window, 1)
-    valid_time = (time_idx_exp >= 0) & (time_idx_exp < temp_wh.shape[0])
-    time_idx_exp = np.clip(time_idx_exp, 0, temp_wh.shape[0] - 1) 
-
-    space_idx = chan_best + channel_window  # (n_spikes, n_channels)
-    space_idx_exp = space_idx[None, None, :]  # (1, 1, n_channels)
-    valid_space = (space_idx_exp >= 0) & (space_idx_exp < temp_wh.shape[1])
-    space_idx_exp = np.clip(space_idx_exp, 0, temp_wh.shape[1] - 1)  # Ensure indices are within bounds
+    time_idx = t_center[:, None] + time_window[None, :]  # (n_spikes, n_samples)
     
-    time_idx_broadcasted = np.broadcast_to(time_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
-    space_idx_broadcasted = np.broadcast_to(space_idx_exp, (time_idx.shape[0], time_idx.shape[1], space_idx.shape[0]))
-    flat_time_idx = time_idx_broadcasted.reshape(-1)
-    flat_space_idx = space_idx_broadcasted.reshape(-1)
+    # Broadcast to shape (n_spikes, n_samples, n_channels)
+    time_idx_broadcasted = np.broadcast_to(time_idx[:, :, None], (n_spikes, n_samples, n_channels))
+    space_idx_broadcasted = np.broadcast_to(space_idx[None, None, :], (n_spikes, n_samples, n_channels))
 
-    waveforms_flat = temp_wh[flat_time_idx, flat_space_idx]  # shape: (126*81*10,)
-    waveforms = waveforms_flat.reshape(time_idx.shape[0], time_idx.shape[1], space_idx.shape[0])  # (126, 81, 10)
-    waveforms = waveforms.astype(np.float32)
-    waveforms[~valid_time | ~valid_space] = np.nan
-    return waveforms
+    valid_time = (time_idx_broadcasted >= 0) & (time_idx_broadcasted < temp_wh.shape[0])
+    valid_space = (space_idx_broadcasted >= 0) & (space_idx_broadcasted < temp_wh.shape[1])
+    valid_mask = valid_time & valid_space  # (n_spikes, n_samples, n_channels)
+
+    waveforms = np.full((n_spikes, n_samples, n_channels), np.nan, dtype=np.float32)
+
+    valid_time_idx = time_idx_broadcasted[valid_mask]
+    valid_space_idx = space_idx_broadcasted[valid_mask]
+    waveforms[valid_mask] = temp_wh[valid_time_idx, valid_space_idx]  # Fill valid indices
+
+    return waveforms # (n_spikes, n_samples, n_channels)
 
 # https://github.com/m-beau/NeuroPyxels?tab=readme-ov-file#load-waveforms-from-unit-u
 def get_raw_waveforms(dp, u, n_waveforms=100, t_waveforms=82, selection='regular', periods='all',
