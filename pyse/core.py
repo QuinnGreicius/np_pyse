@@ -1176,7 +1176,7 @@ class SE:
         df = pd.DataFrame(columns=['spike_time', 'spike_cluster', 'spike_amplitude', 'depth', 'probe'])
         for ks_dir in self.ks_dirs:
             # if ops.npy exists, find the sample rate from there
-            sample_rate = extract_waveform.get_sample_rate(ks_dir)
+            sample_rate = extract_waveform.get_fs(ks_dir)
 
             spike_indices = np.load(ks_dir / "spike_times.npy").squeeze()
             spike_times = spike_indices / sample_rate  # Convert spike indices to seconds

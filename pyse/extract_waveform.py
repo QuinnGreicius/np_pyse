@@ -110,6 +110,8 @@ def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=80, n_channels=10,
                             spike_times=None, spike_clusters=None, templates=None,
                             temp_wh=None, fs=None, t0=None, n_spikes=None, channel_positions=None, 
                             channel_map=None, seed=0):
+
+    ## Note that this has different behavior from Many's matlab version: it doesn't take a center of mass, just the max channel
     ks_folder = Path(ks_folder)
     
     if temp_wh is None:
