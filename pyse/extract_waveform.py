@@ -69,10 +69,10 @@ def get_tmin(ks_folder):
     # Check if ops.npy exists
     ops_path = ks_folder / 'ops.npy'
     rez_path = ks_folder / 'rez.mat'
-    if ops_path.exists() and t0 is None:
+    if ops_path.exists():
         ops = np.load(ops_path, allow_pickle=True).item()
         return ops['tmin']
-    elif rez_path.exists() and t0 is None:
+    elif rez_path.exists():
         rez = read_rezfile(ks_folder)
         return rez['ops']['trange'][0]
     else:
@@ -81,6 +81,8 @@ def get_tmin(ks_folder):
 def read_whitened_waveforms(ks_folder, clus_id=0, n_samples=40, n_channels=10,
                             spike_times=None, spike_clusters=None, templates=None,
                             temp_wh=None, fs=None, t0=None):
+
+    ## Note that this has different behavior from Many's matlab version: it doesn't take a center of mass, just the max channel
     ks_folder = Path(ks_folder)
     
     if temp_wh is None:
